@@ -2,6 +2,13 @@
 .atomcode
 .claude
 
+# Composer 依赖（通过 composer install 安装）
 vendor
-
 composer.lock
+
+# PHP 工具缓存
+.phpunit/
+.php-cs-fixer.cache
+
+# 运行时产物
+logs/

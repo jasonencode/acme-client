@@ -2,7 +2,8 @@
 
 namespace Jason\Acme;
 
-use GuzzleHttp\Exception\ClientException;
+use Jason\Acme\Enum\KeyType;
+use Jason\Acme\Exception\AcmeException;
 
 /**
  * Helper 类
@@ -11,34 +12,48 @@ use GuzzleHttp\Exception\ClientException;
  */
 class Helper
 {
-
     /**
-     * 格式化转换器
-     * @param $pem
-     * @return false|string
-     * @see https://eidson.info/post/php_eol_is_broken
+     * 将 PEM 格式的密钥转换为 DER 二进制格式
+     *
+     * ACME 协议中，JWS 签名时需将账户密钥以 DER 格式进行 digest 计算。
+     * 该步骤位于密钥生成之后、JWK 指纹计算之前——先 toDer() 解码，再 toSafeString() 编码为 base64url。
+     * PEM 是 base64 文本格式，DER 是原始二进制格式，此方法去除 PEM 头尾标记并解码。
+     *
+     * @param string $pem   PEM 格式的密钥字符串（含 -----BEGIN/END----- 标记）
+     *
+     * @return string DER 二进制原始数据
+     * @throws \Exception 当 base64 解码失败时抛出
      */
-    public static function toDer($pem)
+    public static function toDer(string $pem): string
     {
         $lines = preg_split('/\n|\r\n?/', $pem);
         $lines = array_slice($lines, 1, -1);
 
-        return base64_decode(implode('', $lines));
+        $result = base64_decode(implode('', $lines));
+        if ($result === false) {
+            throw new AcmeException('Could not decode PEM to DER');
+        }
+
+        return $result;
     }
 
     /**
-     * 返回证书过期日期
+     * 解析证书并返回过期日期
      *
-     * @param $certificate
+     * 在 ACME 证书续期流程中，调用此方法检查已签发证书的 validTo 时间。
+     * 上游：splitCertificate() 拆分后的域名证书作为输入；
+     * 下游：调用方据此判断是否需要在证书到期前（通常提前 30 天）重新发起订单流程。
      *
-     * @return \DateTime
-     * @throws \Exception
+     * @param string $certificate   PEM 格式的 X.509 证书字符串
+     *
+     * @return \DateTime 证书过期日期
+     * @throws \Exception 当 openssl 无法解析证书时抛出
      */
-    public static function getCertExpiryDate($certificate): \DateTime
+    public static function getCertExpiryDate(string $certificate): \DateTime
     {
         $info = openssl_x509_parse($certificate);
         if ($info === false) {
-            throw new \Exception('Could not parse certificate');
+            throw new AcmeException('Could not parse certificate');
         }
         $dateTime = new \DateTime();
         $dateTime->setTimestamp($info['validTo_time_t']);
@@ -46,43 +61,83 @@ class Helper
         return $dateTime;
     }
 
-    public static function getNewECKey(): string
+    /**
+     * 根据指定类型生成新密钥
+     *
+     * 支持 RSA 和 EC 两种密钥类型，用于 ACME 账户注册或证书请求。
+     * 默认使用 EC P-384 密钥（ACME 协议推荐）。
+     *
+     * @param KeyType $type 密钥类型枚举
+     *
+     * @return string PEM 格式的私钥字符串
+     * @throws \Exception 当密钥生成失败时抛出
+     */
+    public static function getNewKeyByType(KeyType $type = KeyType::EC_384): string
     {
-        $key = openssl_pkey_new([
-            'private_key_type' => OPENSSL_KEYTYPE_EC,
-            'curve_name' => 'secp384r1',
-        ]);
-        openssl_pkey_export($key, $pem);
+        $openSSLType = $type->getOpenSSLType();
+        $parameter = $type->getParameter();
+
+        $config = [
+            'private_key_type' => $openSSLType,
+        ];
+
+        if ($openSSLType === OPENSSL_KEYTYPE_EC) {
+            $config['curve_name'] = $parameter;
+        } else {
+            $config['private_key_bits'] = $parameter;
+        }
+
+        $key = openssl_pkey_new($config);
+        if ($key === false) {
+            throw new AcmeException('Could not generate ' . $type->getLabel() . ' key');
+        }
+
+        if (openssl_pkey_export($key, $pem) === false) {
+            throw new AcmeException('Could not export ' . $type->getLabel() . ' key as PEM');
+        }
 
         return $pem;
     }
 
     /**
-     * 获取新的 RSA 密钥
+     * 生成 RSA 密钥对并返回 PEM 格式的私钥
      *
-     * @return string
+     * 兼容场景：部分 CA 或旧版系统不支持 EC 密钥时，使用 RSA 作为备选。
+     * 此方法是 getNewKeyByType() 的便捷别名。
+     *
+     * @param int $keyLength RSA 密钥长度（bit），如 2048、4096（默认 4096）
+     *
+     * @return string PEM 格式的 RSA 私钥字符串
+     * @throws \Exception 当 OpenSSL 密钥生成或导出失败时抛出
      */
-    public static function getNewKey(int $keyLength): string
+    public static function getNewKey(int $keyLength = 4096): string
     {
-        $key = openssl_pkey_new([
-            'private_key_bits' => $keyLength,
-            'private_key_type' => OPENSSL_KEYTYPE_RSA,
-        ]);
-        openssl_pkey_export($key, $pem);
+        $keyType = match ($keyLength) {
+            2048 => KeyType::RSA_2048,
+            3072 => KeyType::RSA_3072,
+            4096 => KeyType::RSA_4096,
+            default => throw new AcmeException('Unsupported RSA key length: ' . $keyLength . '. Supported lengths: 2048, 3072, 4096'),
+        };
 
-        return $pem;
+        return self::getNewKeyByType($keyType);
     }
 
     /**
-     * 获取新的证书签名请求（CSR）
+     * 创建证书签名请求（CSR）
      *
-     * @param array $domains
-     * @param       $key
+     * 在 ACME 订单（Order）流程的最后阶段调用，用于向 CA 提交域名列表以申请证书。
+     * 上游：getNewECKey() 或 getNewKey() 生成的私钥作为签名密钥；
+     *      $domains 数组包含需要保护的所有域名（主域名 + 附加域名 SAN）。
+     * 下游：生成的 CSR PEM 字符串通过 Client::finalizeOrder() 提交给 ACME 服务端。
+     * 内部生成临时 OpenSSL 配置文件以注入 subjectAltName（SAN）扩展，主域名设 commonName。
      *
-     * @return string
-     * @throws \Exception
+     * @param array                    $domains  域名列表，第一个元素为主域名，其余为 SAN
+     * @param \OpenSSLAsymmetricKey|string $key      用于签名 CSR 的私钥（PEM 字符串或 OpenSSL 资源）
+     *
+     * @return string PEM 格式的 CSR 字符串
+     * @throws \Exception 当 CSR 创建或导出失败时抛出
      */
-    public static function getCsr(array $domains, $key): string
+    public static function getCsr(array $domains, \OpenSSLAsymmetricKey|string $key): string
     {
         $primaryDomain = current(($domains));
         $config = [
@@ -110,11 +165,11 @@ class Helper
         unlink($fn);
 
         if ($csr === false) {
-            throw new \Exception('Could not create a CSR');
+            throw new AcmeException('Could not create a CSR');
         }
 
         if (openssl_csr_export($csr, $result) == false) {
-            throw new \Exception('CRS export failed');
+            throw new AcmeException('CRS export failed');
         }
 
         $result = trim($result);
@@ -125,11 +180,11 @@ class Helper
     /**
      * 生成安全的 base64 字符串
      *
-     * @param $data
+     * @param string $data
      *
      * @return string
      */
-    public static function toSafeString($data): string
+    public static function toSafeString(string $data): string
     {
         return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
     }
@@ -137,14 +192,16 @@ class Helper
     /**
      * 获取密钥信息
      *
+     * @param \OpenSSLAsymmetricKey $key
+     *
      * @return array
      * @throws \Exception
      */
-    public static function getKeyDetails($key): array
+    public static function getKeyDetails(\OpenSSLAsymmetricKey $key): array
     {
         $accountDetails = openssl_pkey_get_details($key);
         if ($accountDetails === false) {
-            throw new \Exception('Could not load account details');
+            throw new AcmeException('Could not load account details');
         }
 
         return $accountDetails;
@@ -169,7 +226,7 @@ class Helper
         $intermediate = $certificates['intermediate'] ?? null;
 
         if (!$domain || !$intermediate) {
-            throw new \Exception('Could not parse certificate string');
+            throw new AcmeException('Could not parse certificate string');
         }
 
         return [$domain, $intermediate];
